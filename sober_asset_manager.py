@@ -2,13 +2,14 @@
 """
 Sober Asset Overlay Manager
 ----------------------------
-A small GUI tool for installing custom cursors, sounds, or any other
+A small GUI tool for installing custom cursors, fonts, or any other
 replaceable asset into Sober (the Linux Roblox client by VinegarHQ),
 using its "asset overlay" system.
 
 Includes:
-  - Cursor and sound replacement (with known common filenames)
+  - Cursor and font replacement (with known common filenames + full font family patching)
   - A "Custom path" mode for any other overlay-able asset
+  - Preset management (save, load, and delete custom configurations)
   - Automatic backups + per-change undo
   - A panic button to instantly disable ALL mods if something breaks
     (e.g. the game fails to load / softlocks), and re-enable them later
@@ -20,24 +21,18 @@ Requires: python3, tkinter, and Pillow (optional, for image preview)
     Install Pillow (optional):        pip install --user Pillow
 
 Run with:  python3 sober_asset_manager.py
-
-Notes on sound filenames: Roblox doesn't publish an official list of its
-internal asset filenames, and they can change between client updates.
-The ones listed here are commonly referenced by the community (e.g. in
-VinegarHQ's own docs) but aren't guaranteed to be current. For anything
-not listed, you'll need to find the exact filename/path yourself by
-opening the Roblox APK in an archive manager and matching it under
-packages/com.roblox.client/base.apk/assets/content/... — the overlay
-must mirror that exact structure.
 """
 
 import os
+import re
 import json
 import shutil
 import zipfile
 import datetime
+import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, ttk, simpledialog
+from pathlib import Path
 
 try:
     from PIL import Image, ImageTk
@@ -55,21 +50,20 @@ ASSET_OVERLAY_DIR = os.path.join(SOBER_DATA_DIR, "asset_overlay")
 PACKAGES_DIR = os.path.join(SOBER_DATA_DIR, "packages")
 
 # Extensions grouped for the asset finder's filter dropdown
-SOUND_EXTS = (".mp3", ".ogg", ".wav")
+FONT_EXTS = (".ttf", ".otf")
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tga")
 
 APP_DATA_DIR = os.path.expanduser("~/.local/share/sober-asset-manager")
 BACKUPS_DIR = os.path.join(APP_DATA_DIR, "backups")
+PRESETS_DIR = os.path.join(APP_DATA_DIR, "presets")
 HISTORY_FILE = os.path.join(APP_DATA_DIR, "history.json")
 
 # ---------------------------------------------------------------------
 # Known asset categories
-# label -> relative path from asset_overlay/, or "" if user must type
-# the file name themselves (custom mode)
 # ---------------------------------------------------------------------
 
 CURSOR_BASE = "content/textures/Cursors/KeyboardMouse"
-SOUND_BASE = "content/sounds"
+FONT_BASE = "content/fonts"
 
 CURSOR_KNOWN = {
     "Arrow (default pointer)": "ArrowCursor.png",
@@ -78,18 +72,15 @@ CURSOR_KNOWN = {
     "Custom filename...": "",
 }
 
-# Only one filename here is confirmed (from VinegarHQ's own docs). Everything
-# else varies by client version/platform — use "Find asset..." to look up
-# real current filenames from your own installed Roblox files instead of
-# guessing.
-SOUND_KNOWN = {
-    "Death/damage sound (ouch.ogg)": "ouch.ogg",
+FONT_KNOWN = {
+    "Source Sans Pro Regular (SourceSansPro-Regular.ttf)": "SourceSansPro-Regular.ttf",
+    "Builder Sans Regular (BuilderSans-Regular.ttf)": "BuilderSans-Regular.ttf",
     "Custom filename...": "",
 }
 
 CATEGORIES = {
+    "Font": {"base": FONT_BASE, "known": FONT_KNOWN, "ext": ".ttf"},
     "Cursor": {"base": CURSOR_BASE, "known": CURSOR_KNOWN, "ext": ".png"},
-    "Sound": {"base": SOUND_BASE, "known": SOUND_KNOWN, "ext": ""},
     "Custom path (advanced)": {"base": "", "known": {}, "ext": ""},
 }
 
@@ -114,6 +105,16 @@ WARN_HOVER = "#d6900f"
 FONT_FAMILY = "Sans"
 
 
+def find_base_apk():
+    if not os.path.isdir(PACKAGES_DIR):
+        return None
+    for root, _dirs, files in os.walk(PACKAGES_DIR):
+        for f in files:
+            if f == "base.apk" and "com.roblox.client" in root:
+                return os.path.join(root, f)
+    return None
+
+
 class RoundedButton(tk.Button):
     def __init__(self, master, bg=ACCENT, hover=ACCENT_HOVER, fg="#ffffff", **kwargs):
         super().__init__(
@@ -128,11 +129,6 @@ class RoundedButton(tk.Button):
 
 
 def iter_installed_assets():
-    """Yield (display_path, source) for every asset file packed inside
-    Sober's downloaded Roblox .apk files (APKs are ZIP archives), with
-    the path shown relative to 'assets/' — matching the structure
-    asset_overlay expects. 'source' is (apk_path, entry_name) in case a
-    future version wants to extract the original file."""
     if not os.path.isdir(PACKAGES_DIR):
         return
     for root, _dirs, files in os.walk(PACKAGES_DIR):
@@ -158,17 +154,14 @@ def iter_installed_assets():
 
 
 class AssetFinderDialog(tk.Toplevel):
-    """Lets the user search Sober's actual downloaded Roblox files to find
-    a real, current asset filename/path instead of guessing one."""
-
     def __init__(self, master, on_pick, ext_filter=None):
         super().__init__(master)
         self.title("Find asset in your Roblox files")
         self.geometry("560x460")
         self.configure(bg=BG)
         self.on_pick = on_pick
-        self.ext_filter = ext_filter  # tuple of extensions or None for all
-        self._all_results = None
+        self.ext_filter = ext_filter
+        self._all_results = []
 
         tk.Label(
             self, text="Search files Sober has already downloaded for this "
@@ -202,7 +195,7 @@ class AssetFinderDialog(tk.Toplevel):
         scrollbar.config(command=self.listbox.yview)
         self.listbox.bind("<Double-Button-1>", lambda e: self._pick())
 
-        self.status = tk.Label(self, text="", bg=BG, fg=FG_MUTED,
+        self.status = tk.Label(self, text="Scanning installed Roblox files (please wait)...", bg=BG, fg=WARN,
                                  font=(FONT_FAMILY, 8))
         self.status.pack(fill="x", padx=14)
 
@@ -213,22 +206,24 @@ class AssetFinderDialog(tk.Toplevel):
         RoundedButton(btn_row, text="Cancel", command=self.destroy,
                        bg=BG_PANEL_ALT, hover=BORDER, fg=FG).pack(side="right", padx=(0, 8))
 
-        self._load_all()
-        self._refresh()
+        threading.Thread(target=self._load_all_async, daemon=True).start()
 
-    def _load_all(self):
+    def _load_all_async(self):
         if not os.path.isdir(PACKAGES_DIR):
-            self.status.config(
-                text="No downloaded Roblox files found yet — launch a game "
-                     "in Sober at least once first.", fg=DANGER,
-            )
+            self.after(0, lambda: self.status.config(
+                text="No downloaded Roblox files found yet — launch a game in Sober at least once first.", fg=DANGER
+            ))
             self._all_results = []
             return
         results = list(iter_installed_assets())
         if self.ext_filter:
             results = [r for r in results if r[0].lower().endswith(self.ext_filter)]
         self._all_results = results
-        self.status.config(text=f"{len(results)} files found.")
+        self.after(0, self._on_load_complete)
+
+    def _on_load_complete(self):
+        self.status.config(text=f"{len(self._all_results)} files found.", fg=SUCCESS)
+        self._refresh()
 
     def _refresh(self):
         if self._all_results is None:
@@ -260,12 +255,13 @@ class AssetManagerApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Sober Asset Overlay Manager")
-        self.geometry("600x760")
-        self.minsize(560, 700)
+        self.geometry("600x900")
+        self.minsize(560, 780)
         self.configure(bg=BG)
 
         os.makedirs(APP_DATA_DIR, exist_ok=True)
         os.makedirs(BACKUPS_DIR, exist_ok=True)
+        os.makedirs(PRESETS_DIR, exist_ok=True)
 
         self.selected_file = None
         self.preview_img = None
@@ -275,11 +271,8 @@ class AssetManagerApp(tk.Tk):
         self._build_ui()
         self._on_category_change()
         self._refresh_history_list()
+        self._refresh_presets_list()
         self.after(150, self._check_sober_installed)
-
-    # -----------------------------------------------------------------
-    # Styling
-    # -----------------------------------------------------------------
 
     def _setup_style(self):
         style = ttk.Style(self)
@@ -316,16 +309,12 @@ class AssetManagerApp(tk.Tk):
         body.pack(fill="x", padx=16, pady=(4, 16))
         return body
 
-    # -----------------------------------------------------------------
-    # UI
-    # -----------------------------------------------------------------
-
     def _build_ui(self):
         header = tk.Frame(self, bg=BG)
         header.pack(fill="x", padx=18, pady=(20, 6))
         tk.Label(header, text="🛠  Sober Asset Overlay Manager", bg=BG, fg=FG,
                   font=(FONT_FAMILY, 16, "bold")).pack(anchor="w")
-        tk.Label(header, text="Replace cursors, sounds, or other assets in Sober",
+        tk.Label(header, text="Replace cursors, fonts, or other assets in Sober",
                   bg=BG, fg=FG_MUTED, font=(FONT_FAMILY, 9)).pack(anchor="w", pady=(2, 0))
 
         # ---- Panic button row ----
@@ -350,6 +339,25 @@ class AssetManagerApp(tk.Tk):
         )
         self.panic_status.pack(fill="x", padx=20, pady=(0, 8), anchor="w")
 
+        # ---- Presets Card ----
+        body_presets = self._card(self, "Presets Management", subtitle="Save, load, or delete configurations of your active asset overlays.")
+        preset_row = tk.Frame(body_presets, bg=BG_PANEL)
+        preset_row.pack(fill="x", pady=(0, 2))
+
+        self.preset_var = tk.StringVar()
+        self.preset_combo = ttk.Combobox(
+            preset_row, textvariable=self.preset_var, state="readonly",
+            font=(FONT_FAMILY, 10),
+        )
+        self.preset_combo.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        RoundedButton(preset_row, text="Save Current...", command=self.save_preset,
+                       bg=ACCENT, hover=ACCENT_HOVER).pack(side="left", padx=(0, 6))
+        RoundedButton(preset_row, text="Load", command=self.load_preset,
+                       bg=BG_PANEL_ALT, hover=BORDER, fg=FG).pack(side="left", padx=(0, 6))
+        RoundedButton(preset_row, text="Delete", command=self.delete_preset,
+                       bg=DANGER, hover=DANGER_HOVER).pack(side="left")
+
         # ---- Step 1: category ----
         body1 = self._card(self, "1 · What are you replacing?")
         self.category_var = tk.StringVar(value=list(CATEGORIES.keys())[0])
@@ -360,12 +368,20 @@ class AssetManagerApp(tk.Tk):
         self.category_combo.pack(fill="x")
         self.category_combo.bind("<<ComboboxSelected>>", self._on_category_change)
 
+        self.known_combo = ttk.Combobox(body1, state="readonly", font=(FONT_FAMILY, 10))
         self.known_var = tk.StringVar()
-        self.known_combo = ttk.Combobox(
-            body1, textvariable=self.known_var, state="readonly",
-            font=(FONT_FAMILY, 10),
-        )
+        self.known_combo.config(textvariable=self.known_var)
         self.known_combo.bind("<<ComboboxSelected>>", self._on_known_change)
+
+        # Font-specific options frame
+        self.font_options_frame = tk.Frame(body1, bg=BG_PANEL)
+        self.patch_families_var = tk.BooleanVar(value=True)
+        self.patch_checkbox = tk.Checkbutton(
+            self.font_options_frame, text="Patch all font family JSON maps automatically (Recommended)",
+            variable=self.patch_families_var, bg=BG_PANEL, fg=FG, selectcolor=BG_PANEL_ALT,
+            activebackground=BG_PANEL, activeforeground=FG, font=(FONT_FAMILY, 9),
+        )
+        self.patch_checkbox.pack(anchor="w", pady=(6, 0))
 
         self.custom_path_row = tk.Frame(body1, bg=BG_PANEL)
         self.custom_path_var = tk.StringVar()
@@ -385,7 +401,7 @@ class AssetManagerApp(tk.Tk):
 
         self.custom_path_hint = tk.Label(
             body1,
-            text="Path relative to asset_overlay/, e.g. content/sounds/ouch.ogg",
+            text="Path relative to asset_overlay/, e.g. content/fonts/BuilderSans-Regular.ttf",
             bg=BG_PANEL, fg=FG_MUTED, font=(FONT_FAMILY, 8),
         )
 
@@ -440,7 +456,7 @@ class AssetManagerApp(tk.Tk):
         scrollbar = tk.Scrollbar(list_frame)
         scrollbar.pack(side="right", fill="y")
         self.history_list = tk.Listbox(
-            list_frame, height=7, bg=BG_PANEL_ALT, fg=FG,
+            list_frame, height=5, bg=BG_PANEL_ALT, fg=FG,
             selectbackground=ACCENT, selectforeground="#ffffff",
             relief="flat", font=(FONT_FAMILY, 9), highlightthickness=0, bd=0,
             yscrollcommand=scrollbar.set,
@@ -463,13 +479,105 @@ class AssetManagerApp(tk.Tk):
         )
         footer.pack(fill="x", padx=20, pady=(0, 14), anchor="w")
 
-    # -----------------------------------------------------------------
-    # Category / field behaviour
-    # -----------------------------------------------------------------
+    def _get_available_presets(self):
+        if not os.path.isdir(PRESETS_DIR):
+            return []
+        return sorted([d for d in os.listdir(PRESETS_DIR) if os.path.isdir(os.path.join(PRESETS_DIR, d))])
+
+    def _refresh_presets_list(self):
+        presets = self._get_available_presets()
+        self.preset_combo["values"] = presets
+        if presets:
+            if self.preset_var.get() not in presets:
+                self.preset_var.set(presets[0])
+        else:
+            self.preset_var.set("")
+
+    def save_preset(self):
+        if not os.path.isdir(ASSET_OVERLAY_DIR) or not os.listdir(ASSET_OVERLAY_DIR):
+            messagebox.showwarning("Empty Overlay", "There are no active asset overrides to save as a preset.")
+            return
+        
+        name = simpledialog.askstring("Save Preset", "Enter a name for this preset:", parent=self)
+        if not name:
+            return
+        
+        name = "".join(c for c in name if c.isalnum() or c in (' ', '_', '-')).strip()
+        if not name:
+            messagebox.showerror("Invalid Name", "Please enter a valid preset name.")
+            return
+
+        target_dir = os.path.join(PRESETS_DIR, name)
+        if os.path.exists(target_dir):
+            if not messagebox.askyesno("Overwrite Preset", f"Preset '{name}' already exists. Overwrite it?"):
+                return
+            shutil.rmtree(target_dir)
+
+        try:
+            shutil.copytree(ASSET_OVERLAY_DIR, target_dir)
+            self._refresh_presets_list()
+            self.preset_var.set(name)
+            self._set_status(f"✓ Preset '{name}' saved successfully.", SUCCESS)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save preset:\n{e}")
+
+    def load_preset(self):
+        name = self.preset_var.get().strip()
+        if not name:
+            messagebox.showwarning("No Preset Selected", "Please select a preset to load.")
+            return
+
+        preset_path = os.path.join(PRESETS_DIR, name)
+        if not os.path.isdir(preset_path):
+            messagebox.showerror("Error", f"Preset '{name}' does not exist.")
+            self._refresh_presets_list()
+            return
+
+        if not messagebox.askyesno("Load Preset", f"Load preset '{name}'? This will merge/apply the preset files into your active asset overlay."):
+            return
+
+        try:
+            os.makedirs(ASSET_OVERLAY_DIR, exist_ok=True)
+            for root, _dirs, files in os.walk(preset_path):
+                rel_root = os.path.relpath(root, preset_path)
+                dest_root = ASSET_OVERLAY_DIR if rel_root == "." else os.path.join(ASSET_OVERLAY_DIR, rel_root)
+                os.makedirs(dest_root, exist_ok=True)
+                for file in files:
+                    src_file = os.path.join(root, file)
+                    dest_file = os.path.join(dest_root, file)
+                    shutil.copyfile(src_file, dest_file)
+            
+            self._set_status(f"✓ Preset '{name}' loaded. Restart Sober to apply changes.", SUCCESS)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load preset:\n{e}")
+
+    def delete_preset(self):
+        name = self.preset_var.get().strip()
+        if not name:
+            messagebox.showwarning("No Preset Selected", "Please select a preset to delete.")
+            return
+
+        preset_path = os.path.join(PRESETS_DIR, name)
+        if not os.path.isdir(preset_path):
+            messagebox.showerror("Error", f"Preset '{name}' does not exist.")
+            self._refresh_presets_list()
+            return
+
+        if not messagebox.askyesno("Delete Preset", f"Are you sure you want to delete the preset '{name}'?"):
+            return
+
+        try:
+            shutil.rmtree(preset_path)
+            self._refresh_presets_list()
+            self._set_status(f"🗑 Preset '{name}' deleted.", WARN)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to delete preset:\n{e}")
 
     def _on_category_change(self, event=None):
-        cat = CATEGORIES[self.category_var.get()]
+        cat_name = self.category_var.get()
+        cat = CATEGORIES[cat_name]
         self.known_combo.pack_forget()
+        self.font_options_frame.pack_forget()
         self.custom_path_row.pack_forget()
         self.custom_path_hint.pack_forget()
 
@@ -480,10 +588,13 @@ class AssetManagerApp(tk.Tk):
             self._on_known_change()
         else:
             self.custom_path_hint.config(
-                text="Path relative to asset_overlay/, e.g. content/sounds/ouch.ogg"
+                text="Path relative to asset_overlay/, e.g. content/fonts/BuilderSans-Regular.ttf"
             )
             self.custom_path_row.pack(fill="x", pady=(8, 2))
             self.custom_path_hint.pack(fill="x")
+
+        if cat_name == "Font":
+            self.font_options_frame.pack(fill="x", pady=(6, 0))
 
     def _on_known_change(self, event=None):
         cat = CATEGORIES[self.category_var.get()]
@@ -499,27 +610,24 @@ class AssetManagerApp(tk.Tk):
     def _open_asset_finder(self):
         cat = CATEGORIES[self.category_var.get()]
         ext_filter = None
-        if cat is CATEGORIES["Sound"]:
-            ext_filter = SOUND_EXTS
+        if cat is CATEGORIES["Font"]:
+            ext_filter = FONT_EXTS
         elif cat is CATEGORIES["Cursor"]:
             ext_filter = IMAGE_EXTS
 
         def handle_pick(display_path):
             if not cat["known"] or self.known_var.get() == "Custom filename...":
-                # full "content/..." path goes straight into the field
                 self.custom_path_var.set(display_path)
             else:
-                # known category: just take the filename part
                 self.custom_path_var.set(os.path.basename(display_path))
 
         AssetFinderDialog(self, handle_pick, ext_filter=ext_filter)
 
     def _target_relative_path(self):
-        """Returns the path relative to ASSET_OVERLAY_DIR, or None if invalid."""
         cat_name = self.category_var.get()
         cat = CATEGORIES[cat_name]
 
-        if not cat["known"]:  # Custom path (advanced)
+        if not cat["known"]:
             rel = self.custom_path_var.get().strip().lstrip("/")
             return rel or None
 
@@ -534,12 +642,18 @@ class AssetManagerApp(tk.Tk):
             fname += cat["ext"]
         return f"{cat['base']}/{fname}"
 
-    # -----------------------------------------------------------------
-    # File picking / preview
-    # -----------------------------------------------------------------
-
     def browse_file(self):
-        path = filedialog.askopenfilename(title="Choose a replacement file")
+        cat_name = self.category_var.get()
+        filetypes = [("All Files", "*.*")]
+        if cat_name == "Font":
+            filetypes = [("Font Files", "*.ttf *.otf *.ttc"), ("All Files", "*.*")]
+        elif cat_name == "Cursor":
+            filetypes = [("Image Files", "*.png *.jpg *.jpeg *.bmp"), ("All Files", "*.*")]
+
+        path = filedialog.askopenfilename(
+            title="Choose a replacement file",
+            filetypes=filetypes
+        )
         if not path:
             return
         self.selected_file = path
@@ -557,18 +671,82 @@ class AssetManagerApp(tk.Tk):
                 return
             except Exception:
                 pass
-        icon = "🔊" if path.lower().endswith((".ogg", ".wav", ".mp3")) else "📄"
+        icon = "🔤" if path.lower().endswith((".ttf", ".otf", ".ttc")) else "📄"
         self.preview_canvas.config(text=icon, image="")
-
-    # -----------------------------------------------------------------
-    # Install / backup / undo
-    # -----------------------------------------------------------------
 
     def install_asset(self):
         if not self.selected_file:
             self._set_status("Please choose a replacement file first.", DANGER)
             return
 
+        cat_name = self.category_var.get()
+
+        # Handle Full Font Family Patching if Font category & checkbox enabled
+        if cat_name == "Font" and self.patch_families_var.get():
+            apk_path = find_base_apk()
+            if not apk_path or not os.path.isfile(apk_path):
+                messagebox.showerror(
+                    "Roblox APK Not Found",
+                    "Could not locate base.apk. Make sure Sober/Roblox has been launched at least once."
+                )
+                return
+
+            font_filename = os.path.basename(self.selected_file)
+            ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup_path = os.path.join(BACKUPS_DIR, f"{ts}__font_patch_backup")
+            os.makedirs(backup_path, exist_ok=True)
+
+            overlay_fonts_dir = os.path.join(ASSET_OVERLAY_DIR, "content", "fonts")
+            overlay_families_dir = os.path.join(overlay_fonts_dir, "families")
+            alt_fonts_dir = os.path.join(ASSET_OVERLAY_DIR, "fonts")
+
+            try:
+                if os.path.isdir(overlay_fonts_dir):
+                    shutil.copytree(overlay_fonts_dir, os.path.join(backup_path, "content_fonts"), dirs_exist_ok=True)
+                if os.path.isdir(alt_fonts_dir):
+                    shutil.copytree(alt_fonts_dir, os.path.join(backup_path, "alt_fonts"), dirs_exist_ok=True)
+
+                os.makedirs(overlay_families_dir, exist_ok=True)
+                os.makedirs(alt_fonts_dir, exist_ok=True)
+
+                # Extract fresh font-family JSON maps from base.apk
+                with zipfile.ZipFile(apk_path, 'r') as zf:
+                    for member in zf.namelist():
+                        if member.startswith("assets/content/fonts/families/") and member.endswith(".json"):
+                            fname = os.path.basename(member)
+                            if fname:
+                                with zf.open(member) as src, open(os.path.join(overlay_families_dir, fname), "wb") as dst:
+                                    dst.write(src.read())
+
+                # Copy font files into overlay locations
+                shutil.copyfile(self.selected_file, os.path.join(overlay_fonts_dir, font_filename))
+                shutil.copyfile(self.selected_file, os.path.join(alt_fonts_dir, font_filename))
+
+                # Patch non-emoji font-family JSON files via regex
+                asset_id_regex = re.compile(r'("assetId"\s*:\s*")[^"]*(")')
+                changed = 0
+                for json_path in Path(overlay_families_dir).glob("*.json"):
+                    lower_name = json_path.name.lower()
+                    if "emoji" in lower_name or "twemoji" in lower_name:
+                        continue
+                    text = json_path.read_text(encoding="utf-8")
+                    new_text, count = asset_id_regex.subn(
+                        lambda m: f'{m.group(1)}rbxasset://fonts/{font_filename}{m.group(2)}',
+                        text
+                    )
+                    if count > 0:
+                        json_path.write_text(new_text, encoding="utf-8")
+                        changed += 1
+
+                self._add_history_entry("content/fonts/families (Full Font Patch)", backup_path)
+                self._set_status(f"✓ Installed font & patched {changed} family files. Fully restart Sober!", SUCCESS)
+                return
+
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to patch font families:\n{e}")
+                return
+
+        # Standard asset overlay installation flow
         rel_path = self._target_relative_path()
         if not rel_path:
             self._set_status("Please choose or type a target filename/path.", DANGER)
@@ -638,15 +816,44 @@ class AssetManagerApp(tk.Tk):
             self.history_list.insert(tk.END, f"  {ts}  ·  {entry['rel_path']}  ({had_backup})")
 
     def _undo_entry(self, entry):
-        dest = os.path.join(ASSET_OVERLAY_DIR, entry["rel_path"])
+        rel_path = entry["rel_path"]
+        if rel_path == "content/fonts/families (Full Font Patch)":
+            # Restore full font backup directory if available
+            backup_dir = entry["backup_path"]
+            try:
+                overlay_fonts_dir = os.path.join(ASSET_OVERLAY_DIR, "content", "fonts")
+                alt_fonts_dir = os.path.join(ASSET_OVERLAY_DIR, "fonts")
+                
+                # Clear current font overlay items
+                if os.path.isdir(overlay_fonts_dir):
+                    shutil.rmtree(overlay_fonts_dir)
+                if os.path.isdir(alt_fonts_dir):
+                    shutil.rmtree(alt_fonts_dir)
+
+                # Restore backup contents if present
+                if backup_dir and os.path.isdir(backup_dir):
+                    cf_backup = os.path.join(backup_dir, "content_fonts")
+                    af_backup = os.path.join(backup_dir, "alt_fonts")
+                    if os.path.isdir(cf_backup):
+                        shutil.copytree(cf_backup, overlay_fonts_dir)
+                    if os.path.isdir(af_backup):
+                        shutil.copytree(af_backup, alt_fonts_dir)
+                
+                self._set_status("↩ Reverted full font family patch. Restart Sober.", WARN)
+                return True
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to undo font patch:\n{e}")
+                return False
+
+        dest = os.path.join(ASSET_OVERLAY_DIR, rel_path)
         try:
             if entry["backup_path"] and os.path.isfile(entry["backup_path"]):
                 shutil.copyfile(entry["backup_path"], dest)
-                msg = f"Restored previous version of {entry['rel_path']}."
+                msg = f"Restored previous version of {rel_path}."
             else:
                 if os.path.isfile(dest):
                     os.remove(dest)
-                msg = f"Removed override for {entry['rel_path']} (back to Roblox default)."
+                msg = f"Removed override for {rel_path} (back to Roblox default)."
         except Exception as e:
             messagebox.showerror("Error", f"Failed to undo:\n{e}")
             return False
@@ -658,7 +865,6 @@ class AssetManagerApp(tk.Tk):
         if not sel:
             self._set_status("Select a change in the list to undo.", FG_MUTED)
             return
-        # listbox is reversed, so map back to the real index
         idx = len(self.history) - 1 - sel[0]
         entry = self.history[idx]
         if messagebox.askyesno("Undo change", f"Undo change to {entry['rel_path']}?"):
@@ -681,12 +887,7 @@ class AssetManagerApp(tk.Tk):
     def _set_status(self, text, color):
         self.status_label.config(text=text, fg=color)
 
-    # -----------------------------------------------------------------
-    # Panic button: disable / re-enable ALL mods at once
-    # -----------------------------------------------------------------
-
     def _disabled_dirs(self):
-        """Any previously-disabled overlay folders sitting next to asset_overlay."""
         if not os.path.isdir(SOBER_DATA_DIR):
             return []
         return sorted(
@@ -703,7 +904,7 @@ class AssetManagerApp(tk.Tk):
             return
         if not messagebox.askyesno(
             "Disable all mods",
-            "This instantly disables every asset override (cursors, sounds, "
+            "This instantly disables every asset override (cursors, fonts, "
             "anything else) by moving the whole overlay folder aside.\n\n"
             "Nothing is deleted — you can bring it all back with "
             "'Re-enable my mods'.\n\nFully restart Sober afterward. Continue?",
@@ -749,10 +950,6 @@ class AssetManagerApp(tk.Tk):
             text="↩ Mods re-enabled. Fully quit and reopen Sober to see them again.",
             fg=SUCCESS,
         )
-
-    # -----------------------------------------------------------------
-    # Startup check
-    # -----------------------------------------------------------------
 
     def _check_sober_installed(self):
         if os.path.isdir(SOBER_APP_DIR):
