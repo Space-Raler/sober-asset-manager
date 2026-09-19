@@ -1,0 +1,3 @@
+# Optional — only needed for the image preview thumbnail.
+# The app runs fine without it, just without the preview.
+Pillow
